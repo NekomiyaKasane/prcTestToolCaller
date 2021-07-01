@@ -2,9 +2,14 @@ import datetime
 import getopt
 import os
 import subprocess
+import sys
 import threading
 import platform
+import multiprocessing as mp
+import time
+
 import pandas as pd
+import json
 
 # import time
 # import random
@@ -18,6 +23,7 @@ print("Working dir: {0}".format(working_dir))
 timeout_factor = 600
 jobs = 5
 print_info = True
+run_time = datetime.datetime.now()
 
 NULL = "/dev/null" if platform == "Linux" else "NUL"
 
@@ -27,13 +33,11 @@ def get_filesize_megabyte(inpath):
 
 
 def make_dirs(indir):
-    try:
+    if not os.path.isdir(indir):
         os.makedirs(indir, 0o0777)
-    except Exception as e:
-        print(e)
-        return False
-    print("Directory {0} doesn't exist, new directory made.".format(indir))
-    return True
+        print("Directory {0} doesn't exist, new directory made.".format(indir))
+        return True
+    return False
 
 
 def run_cmd(cmdl, base_time=1.0, lock=None, semaphore=None):
@@ -54,13 +58,19 @@ def run_cmd(cmdl, base_time=1.0, lock=None, semaphore=None):
     return process.returncode
 
 
-def generate_file(inpath, outpath, lock=None, semaphore=None, force_num=(-1, -1)):
+def generate_file_wrapper(args):
+    global exe_path
+    exe_path = args[0]
+    return generate_file(*(args[1:]))
+
+
+def generate_file(inpath, outpath, force_num=(-1, -1)):
     # inpath and outpath all single files
 
     filesize = get_filesize_megabyte(inpath)
     cmdl = "\"{0}\" --generate-only -i \"{1}\" -o \"{2}\" > {3}" \
         .format(exe_path, inpath, outpath, NULL)
-    returncode = run_cmd(cmdl, base_time=filesize, lock=None, semaphore=semaphore)
+    returncode = run_cmd(cmdl, base_time=filesize)
     if print_info:
         if not returncode:
             info = "\033[0;31m Failed \033[0m"
@@ -108,33 +118,13 @@ def generate_files(indir, outdir, recursive=True, flatten=False):
                         os.makedirs(os.path.dirname(out))
             global jobs
             if jobs < 2:
-                for i in range(len(ins)):
-                    generate_file(ins[i], outs[i])
-            else:
-                # lock = threading.RLock()
-                semaphore = threading.BoundedSemaphore(jobs)
-                threads = []
                 total = len(ins)
                 for i in range(total):
-                    t = threading.Thread(target=generate_file,
-                                         args=(ins[i], outs[i], None, semaphore, (total - i, total),))
-                    threads.append(t)
-                cur_threads = []
-                while len(threads) > 0:
-                    if len(threading.enumerate()) <= jobs:
-                        for i in range(jobs * 2):
-                            cur_threads.append(threads.pop())
-                            if len(threads) == 0:
-                                break
-                        for ts in cur_threads:
-                            ts.start()
-                        for tj in cur_threads:
-                            tj.join()
-                        cur_threads = []
-                # for ts in threads:
-                #     ts.start()
-                # for tj in threads:
-                #     tj.join()
+                    generate_file(ins[i], outs[i], force_num=(i + 1, total))
+            else:
+                runner = mp.Pool(jobs)
+                args = [(exe_path, ins[i], outs[i], (i + 1, len(ins))) for i in range(len(ins))]
+                runner.map(generate_file_wrapper, args)
             return True
 
         else:  # dir -> not dir
@@ -145,7 +135,13 @@ def generate_files(indir, outdir, recursive=True, flatten=False):
         return False
 
 
-def verify_file(inpath, refpath, outpath, lock=None, semaphore=None, force_num=(-1, -1)):
+def verify_file_wrapper(args):
+    global exe_path
+    exe_path = args[0]
+    return verify_file(*(args[1:]))
+
+
+def verify_file(inpath, refpath, outpath, force_num=(-1, -1)):
     # inpath, outpath and refpath are all single files
     cmdl = "\"{0}\" -i \"{1}\" -o \"{2}\" -r \"{3}\" > \"{4}\" 2>&1" \
         .format(exe_path, inpath, outpath, refpath, outpath)
@@ -204,28 +200,11 @@ def verify_files(indir, refdir, outdir, ref_flattened=False, flatten=False, recu
             total = len(ins)
             if jobs < 2:
                 for i in range(total):
-                    verify_file(ins[i], refs[i], outs[i], lock=None, semaphore=None, force_num=(total - i, total))
+                    verify_file(ins[i], refs[i], outs[i], force_num=(i + 1, total))
             else:
-                semaphore = threading.BoundedSemaphore(jobs)
-                threads = []
-                for i in range(total):
-                    t = threading.Thread(
-                        target=verify_file,
-                        args=(ins[i], refs[i], outs[i], None, semaphore, (total - i, total),)
-                    )
-                    threads.append(t)
-                cur_threads = []
-                while len(threads) > 0:
-                    if len(threading.enumerate()) <= jobs:
-                        for i in range(jobs * 2):
-                            cur_threads.append(threads.pop())
-                            if len(threads) == 0:
-                                break
-                        for ts in cur_threads:
-                            ts.start()
-                        for tj in cur_threads:
-                            tj.join()
-                        cur_threads = []
+                runner = mp.Pool(jobs)
+                args = [(exe_path, ins[i], refs[i], outs[i], (i + 1, len(ins))) for i in range(len(ins))]
+                runner.map(verify_file_wrapper, args)
         else:
             print("Invalid output or reference path.")
             return False
@@ -297,7 +276,7 @@ def count_diagnoses(indir, recursive=True, prefix='>>>>', definer='::', user_fil
     infos = []
     for file in files:
         if user_filter(file):
-            infos.append(count_diagnose(file))
+            infos.append(count_diagnose(file, prefix=prefix, definer=definer))
     return infos
 
 
@@ -312,6 +291,82 @@ def get_diagnoses_dataframe(dict_infos, needed_keys):
             else:
                 table[key].append(None)
     return pd.DataFrame(table)
+
+
+def print_statistics(df):
+    result = df["status"].value_counts().reindex(["failed", "succeed"], fill_value=0)
+    successes = result["succeed"]
+    fails = result["failed"]
+    total = successes + fails
+    total_time = df['time'].astype("float32").sum()
+    succeed_time = df.loc[df["status"] == "succeed"]["time"].astype('float32').sum()
+    failed_time = total_time - succeed_time
+    print('''
+    \033[1;032m[Succeed]\033[0m %8d \033[1;033mtime\033[0m %12.8f
+    \033[1;031m[failed ]\033[0m %8d \033[1;033mtime\033[0m %12.8f
+    \033[1;034m[total  ]\033[0m %8d \033[1;033mtime\033[0m %12.8f
+        ''' % (successes, succeed_time, fails, failed_time, total, total_time)
+          )
+
+
+def run_task(task):
+    if not ('executable' in task and 'input' in task and 'output' in task):
+        return False
+    global jobs, timeout_factor, exe_path, print_info, run_time
+    run_time = datetime.datetime.now()
+    exe_path = task['executable'] if 'executable' in task else exe_path
+    _name = task['name'] if 'name' in task else str(run_time)
+    _generate_csv = (task['export-csv'] if task['export-csv'] != '' else _name + 'csv') if 'export-csv' in task else ''
+    _get_bool = lambda key, dic=task: dic[key] if key in dic else False
+    _generate = _get_bool('generate-only')
+    if not _generate and not 'reference' in task:
+        print('Lack of reference param.')
+        return False
+    _in_r = _get_bool('recursive', dic=task['input'])
+    _out_f = _get_bool('flatten', dic=task['input'])
+    _in_dir = task['input']['path']
+    _out_dir = task['output']['path']
+    _ref_f = False
+    _ref_dir = ""
+    if not _generate:
+        _ref_f = _get_bool('flatten', dic=task['reference'])
+        _ref_dir = task['reference']['path']
+    jobs = int(task['jobs']) if 'jobs' in task else 1
+    timeout_factor = task['timeout-factor'] if 'timeout-factor' in task else 600
+    print_info = _get_bool('print')
+    _collect_keys = task['keys'] if _generate_csv and ('keys' in task) else ['status', 'time'] # default key
+
+    print("\033[1;35mTask: {0} >> {1}\033[0m".format(_name, str(run_time)))
+
+    if _generate:
+        return generate_files(_in_dir, _out_dir, flatten=_out_f, recursive=_in_r)
+    else:
+        _res = verify_files(_in_dir, _ref_dir, _out_dir,
+                            ref_flattened=_ref_f,
+                            flatten=_out_f,
+                            recursive=_in_r
+                            )
+        _diagnoses = count_diagnoses(_out_dir,
+                                     recursive=(False if _out_f else True) and _in_r,
+                                     user_filter=lambda file: datetime.datetime.fromtimestamp(
+                                         os.path.getmtime(file)) > run_time
+                                     )
+        _df = get_diagnoses_dataframe(_diagnoses, _collect_keys)
+        if _generate_csv and not _df.empty:
+            _generate_csv = os.path.abspath(os.path.normpath(_generate_csv))
+            try:
+                if os.path.splitext(_generate_csv)[1] != '.csv':
+                    make_dirs(_generate_csv)
+                    _df.to_csv(os.path.join(_generate_csv, _name + '.csv'), encoding="utf-8-sig")
+                else:
+                    make_dirs(os.path.dirname(_generate_csv))
+                    _df.to_csv(_generate_csv, encoding="utf-8-sig")
+            except Exception as e:
+                print(e)
+                print("\033[1;31mCannot write to csv file. \033[0m")
+            if {'status', 'time'} <= set(_df.keys()):
+                print_statistics(_df)
+        return _res
 
 
 def main(argv=None):
@@ -329,6 +384,7 @@ def main(argv=None):
                             while for verify mode, it's path for .trace
     -R, --ref-path          Specify reference files
     --ref-flattened         Assert reference files are flattened in one folder
+    --export-csv            Enable and specify where to export verification results to csv.
     -------------------------------
     -j, --job               Specify number of parallel threads
     -t, --timeout-factor    Specify time limit to kill threads when time out
@@ -340,84 +396,88 @@ def main(argv=None):
     _ref_flattened = False
     _use_config = False
 
-    global jobs, timeout_factor, exe_path, print_info
+    global jobs, timeout_factor, exe_path, print_info, run_time
     # input_path = "os.path.join(working_dir, "testcase")"
-    exe_path = "C:\\Users\\Administrator\\source\\repos\\test3\\Release\\test3.exe"
-    input_path = "C:\\Users\\Administrator\\Desktop\\新建文件夹\\图纸\\场景测试图纸"
-    output_path = "C:\\Users\\Administrator\\Desktop\\新建文件夹\\Out"
-    ref_path = "C:\\Users\\Administrator\\Desktop\\新建文件夹\\Ref"
+
     config_path = os.path.abspath("tasks.json")
 
-    run_time = datetime.datetime.now()
+    task = {"name": "main", "keys": ["trace", "status", "time"]}
 
-    if argv:
-        opts, args = getopt.getopt(argv[:1], "hi:", ["help", "input-path"])
-        for o, a in opts:
-            if o == "h" or o == "help":
-                print(__doc__)
-                exit(0)
-            if o == "p" or o == "print":
-                print_info = True
-            elif o == "e" or o == "exec":
-                exe_path = str(a)
-            elif o == "I" or o == "input-path":
-                input_path = str(a)
-            elif o == "O" or o == "output-path":
-                output_path = str(a)
-            elif o == "R" or o == "ref-path":
-                ref_path = str(a)
-            elif o == "g" or o == "generate-only":
-                _generate = True
-            elif o == "r" or o == "recursive":
-                _recursive = True
-            elif o == "f" or o == "flatten":
-                _flatten = True
-            elif o == "ref-flattened":
-                _ref_flattened = True
-            elif o == "j" or o == "job":
-                jobs = int(a)
-            elif o == "t" or o == "timeout-factor":
-                timeout_factor = float(a)
-            elif o == "c" or o == "config":
-                _use_config = True
-                config_path = config_path if str(a) == "" else str(a)
-                break
+    if len(argv) == 1:
+        return
 
-    if not (os.path.exists(exe_path) and os.path.exists(input_path)):
-        print("Invalid arguments, executable or input path not exist.")
-        exit(0)
+    opts, args = getopt.getopt(argv[1:],
+                               "hpE:I:O:R:grfj:t:c:",
+                               ["help", "input-path=", "print", "exec=",
+                                "output-path=", "ref-path=", "generate-only", "recursive",
+                                "ref-flattened", "export-csv=", "jobs=", "export-csv",
+                                "timeout-factor=", "config="]
+                               )
+    for o, a in opts:
+        if o == "-h" or o == "--help":
+            print(__doc__)
+            exit(0)
+        if o == "-p" or o == "--print":
+            task['print'] = True
+        elif o == "-E" or o == "--exec":
+            task['executable'] = os.path.normpath(str(a))
+        elif o == "-I" or o == "--input-path":
+            if 'input' in task:
+                task['input']['path'] = os.path.normpath(str(a))
+            else:
+                task['input'] = {'path': os.path.normpath(str(a))}
+        elif o == "-O" or o == "--output-path":
+            if 'output' in task:
+                task['output']['path'] = os.path.normpath(str(a))
+            else:
+                task['output'] = {'path': os.path.normpath(str(a))}
+        elif o == "-R" or o == "--ref-path":
+            if 'reference' in task:
+                task['reference']['path'] = os.path.normpath(str(a))
+            else:
+                task['reference'] = {'path': os.path.normpath(str(a))}
+        elif o == "-g" or o == "--generate-only":
+            task['generate-only'] = True
+        elif o == "-r" or o == "--recursive":
+            if 'input' in task:
+                task['input']['recursive'] = True
+            else:
+                task['input'] = {'recursive': True}
+        elif o == "-f" or o == "--flatten":
+            if 'output' in task:
+                task['output']['flatten'] = True
+            else:
+                task['output'] = {'flatten': True}
+        elif o == "--ref-flattened":
+            if 'reference' in task:
+                task['reference']['flatten'] = True
+            else:
+                task['reference'] = {'flatten': True}
+        elif o == "--export-csv":
+            task['export-csv'] = os.path.normpath(str(a))
+        elif o == "-j" or o == "--jobs":
+            task['jobs'] = int(a)
+        elif o == "-t" or o == "--timeout-factor":
+            task['time-factor'] = float(a)
+        elif o == "-c" or o == "--config":
+            _use_config = True
+            config_path = config_path if str(a) == "" else os.path.normpath(str(a))
+            break
 
-    if _generate:
-        return generate_files(input_path, output_path, flatten=_flatten, recursive=_recursive)
+    if _use_config:
+        if not os.path.isfile(config_path):
+            print("\033[1;31mInvalid config file.")
+            exit(1)
+        else:
+            f = open(config_path, 'r', encoding='utf-8')
+            contents = json.load(f)
+            f.close()
+            tasks = contents['tasks'] if 'tasks' in contents else []
+            for onetask in tasks:
+                run_task(onetask)
     else:
-        res = verify_files(input_path, ref_path, output_path, ref_flattened=_ref_flattened, flatten=_flatten,
-                           recursive=_recursive)
-        diagnoses = count_diagnoses(output_path,
-                                    recursive=(False if _flatten else True) and _recursive,
-                                    user_filter=lambda file: datetime.datetime.fromtimestamp(
-                                        os.path.getmtime(file)) > run_time
-                                    )
-        df = get_diagnoses_dataframe(diagnoses, ["trace", "status", "time"])
-        try:
-            df.to_csv("results.csv", encoding="utf-8-sig")
-        except Exception as e:
-            print(e)
-            print("\033[1;31mCannot write to csv file. \033[0m")
-        result = df["status"].value_counts().reindex(["failed", "succeed"], fill_value=0)
-        successes = result["succeed"]
-        fails = result["failed"]
-        total = successes + fails
-        total_time = df['time'].astype("float32").sum()
-        succeed_time = df.loc[df["status"] == "succeed"]["time"].astype('float32').sum()
-        failed_time = total_time - succeed_time
-        print('''
-        \033[1;032m[Succeed]\033[0m %8d \033[1;033mtime\033[0m %12.8f
-        \033[1;031m[failed ]\033[0m %8d \033[1;033mtime\033[0m %12.8f
-        \033[1;034m[total  ]\033[0m %8d \033[1;033mtime\033[0m %12.8f
-            ''' % (successes, succeed_time, fails, failed_time, total, total_time)
-              )
-        return res
+        return run_task(task)
 
 
 if __name__ == '__main__':
-    main()
+    main(sys.argv)
